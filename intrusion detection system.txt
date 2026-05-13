@@ -1,0 +1,414 @@
+/* ═══════════════════════════════════════════════════════════════
+   ESP32-S3 Smart Radar & Intrusion Detection System
+   ───────────────────────────────────────────────────────────────
+   Features:
+   - Dual-core FreeRTOS (Core 0: Network | Core 1: Radar)
+   - 3-stage software false-alarm filter
+   - Telegram push alerts + remote commands
+   - MQTT live streaming for Python dashboard
+   - Mutex-protected shared state
+   - Auto-reconnect WiFi & MQTT
+   ═══════════════════════════════════════════════════════════════ */
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <PubSubClient.h>
+#include <ESP32Servo.h>
+
+// ═══════════════════════════════════════════════════════════════
+//  CREDENTIALS - EDIT THESE
+// ═══════════════════════════════════════════════════════════════
+const char* ssid     = "Student's LAB";
+const char* password = "kuet@cse321";
+
+#define BOT_TOKEN "8615997921:AAGCbAqlxUJCBfaXgLLf2_bpHw3-QyXzDzA"
+#define CHAT_ID   "1401516541"
+
+// MQTT - change topic to be unique to you (use your roll number)
+const char* MQTT_BROKER = "broker.hivemq.com";
+const int   MQTT_PORT   = 1883;
+const char* MQTT_TOPIC  = "wafi_radar_2307003/data";
+const char* MQTT_ALERTS = "wafi_radar_2307003/alerts";
+
+// ═══════════════════════════════════════════════════════════════
+//  HARDWARE PINS
+// ═══════════════════════════════════════════════════════════════
+#define TrigPin    5
+#define EchoPin    17
+#define ServoPin   9
+#define LED        2
+#define SoundSpeed 0.034   // cm per microsecond
+
+// ═══════════════════════════════════════════════════════════════
+//  DETECTION TUNING (adjust for your environment)
+// ═══════════════════════════════════════════════════════════════
+#define DETECTION_THRESHOLD   40      // cm: object detection range
+#define CONFIRM_COUNT         3       // consecutive readings to trust
+#define ALERT_COOLDOWN_MS     30000   // ms between Telegram alerts
+#define MAX_DISTANCE_JUMP     20      // cm: filter "teleporting" noise
+#define SWEEP_MIN_ANGLE       15
+#define SWEEP_MAX_ANGLE       165
+#define SWEEP_STEP            3
+#define LOOP_PERIOD_MS        80
+
+// ═══════════════════════════════════════════════════════════════
+//  GLOBAL OBJECTS
+// ═══════════════════════════════════════════════════════════════
+WiFiClientSecure  secured_client;       // for Telegram (HTTPS)
+WiFiClient        mqttWifi;             // for MQTT (plain TCP)
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+PubSubClient      mqtt(mqttWifi);
+Servo             myServo;
+
+// ═══════════════════════════════════════════════════════════════
+//  SHARED STATE (between cores - mutex-protected)
+// ═══════════════════════════════════════════════════════════════
+SemaphoreHandle_t dataMutex;
+
+volatile int   currentAngle      = SWEEP_MIN_ANGLE;
+volatile float currentDistance   = 0;
+volatile bool  objectDetected    = false;
+volatile bool  monitoringEnabled = true;
+volatile int   totalAlerts       = 0;
+volatile int   falseAlarmsBlocked = 0;
+
+// Alert queue: radar core writes → telegram core reads
+volatile bool alertPending = false;
+String        alertMessage = "";
+
+// ═══════════════════════════════════════════════════════════════
+//  FORWARD DECLARATIONS
+// ═══════════════════════════════════════════════════════════════
+void handleMessages(int numNewMessages);
+void mqttConnect();
+void wifiReconnect();
+
+// ═══════════════════════════════════════════════════════════════
+//  WIFI RECONNECT
+// ═══════════════════════════════════════════════════════════════
+void wifiReconnect() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  
+  Serial.println("⚠ WiFi lost. Reconnecting...");
+  WiFi.disconnect();
+  WiFi.begin(ssid, password);
+  
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 20) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    tries++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("✓ WiFi reconnected");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  MQTT CONNECT / RECONNECT
+// ═══════════════════════════════════════════════════════════════
+void mqttConnect() {
+  if (mqtt.connected()) return;
+  
+  Serial.print("Connecting to MQTT broker... ");
+  String clientId = "ESP32_Radar_" + String(random(0xffff), HEX);
+  
+  if (mqtt.connect(clientId.c_str())) {
+    Serial.println("✓ Connected!");
+    mqtt.publish(MQTT_ALERTS, "{\"event\":\"online\"}");
+  } else {
+    Serial.print("✗ Failed, rc=");
+    Serial.println(mqtt.state());
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CORE 1 TASK: Radar (smooth, real-time, never blocked)
+// ═══════════════════════════════════════════════════════════════
+void radarTask(void *parameter) {
+  int  angle     = SWEEP_MIN_ANGLE;
+  bool direction = true;
+  
+  // Filter state
+  static int   detectionStreak  = 0;
+  static float lastDistance     = 0;
+  static unsigned long lastAlertTime = 0;
+  static bool  alertActive      = false;
+
+  Serial.println("✓ Radar task on Core " + String(xPortGetCoreID()));
+
+  while (true) {
+    
+    // ── Sweep servo ────────────────────────────────────────
+    if (angle >= SWEEP_MAX_ANGLE) direction = false;
+    if (angle <= SWEEP_MIN_ANGLE) direction = true;
+    angle += direction ? SWEEP_STEP : -SWEEP_STEP;
+    myServo.write(angle);
+
+    // ── Measure distance (HC-SR04) ─────────────────────────
+    digitalWrite(TrigPin, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TrigPin, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TrigPin, LOW);
+    long  duration = pulseIn(EchoPin, HIGH, 30000UL);
+    float distance = duration * SoundSpeed / 2.0;
+
+    // ── Filter 1: Range check ──────────────────────────────
+    bool inRange = (distance > 0 && distance < DETECTION_THRESHOLD);
+    
+    // ── Filter 2: Stability check (no teleporting) ─────────
+    bool stable = false;
+    if (inRange && lastDistance > 0) {
+      float jump = abs(distance - lastDistance);
+      stable = (jump < MAX_DISTANCE_JUMP);
+    }
+    if (inRange && lastDistance == 0) stable = true;
+    lastDistance = inRange ? distance : 0;
+    
+    // ── Filter 3: Confirmation streak ──────────────────────
+    if (inRange && stable) {
+      detectionStreak++;
+    } else {
+      if (detectionStreak > 0 && detectionStreak < CONFIRM_COUNT) {
+        falseAlarmsBlocked++;
+        Serial.println("✗ Blocked false alarm (streak=" + 
+                       String(detectionStreak) + ")");
+      }
+      detectionStreak = 0;
+      alertActive = false;
+    }
+    
+    bool confirmed = (detectionStreak >= CONFIRM_COUNT);
+    digitalWrite(LED, confirmed ? HIGH : LOW);
+    
+    // ── Update shared state ────────────────────────────────
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5))) {
+      currentAngle    = angle;
+      currentDistance = distance;
+      objectDetected  = confirmed;
+      xSemaphoreGive(dataMutex);
+    }
+    
+    // ── Publish to MQTT (for Python dashboard) ─────────────
+    if (mqtt.connected()) {
+      char payload[180];
+      snprintf(payload, sizeof(payload),
+        "{\"angle\":%d,\"distance\":%.1f,\"detected\":%d,"
+        "\"streak\":%d,\"alerts\":%d,\"blocked\":%d}",
+        angle, distance, confirmed ? 1 : 0,
+        detectionStreak, totalAlerts, falseAlarmsBlocked);
+      mqtt.publish(MQTT_TOPIC, payload);
+    }
+    
+    // ── Queue alert for Telegram core ──────────────────────
+    bool cooldownPassed = (millis() - lastAlertTime) > ALERT_COOLDOWN_MS;
+    
+    if (confirmed && !alertActive && cooldownPassed && monitoringEnabled) {
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(5))) {
+        alertPending = true;
+        alertMessage  = "⚠️ *CONFIRMED INTRUSION*\n\n";
+        alertMessage += "📐 Angle: `"    + String(angle)       + "°`\n";
+        alertMessage += "📏 Distance: `" + String(distance, 1) + " cm`\n";
+        alertMessage += "✅ Confirmed: " + String(detectionStreak) + " readings\n";
+        alertMessage += "🛡️ Blocked so far: `" + String(falseAlarmsBlocked) + "` false alarms";
+        xSemaphoreGive(dataMutex);
+      }
+      alertActive   = true;
+      lastAlertTime = millis();
+      totalAlerts++;
+      Serial.println("→ CONFIRMED alert queued");
+    }
+    
+    // ── Serial debug ───────────────────────────────────────
+    Serial.printf("Core%d | %3d°  %6.1fcm  Streak:%d  %s\n",
+                  xPortGetCoreID(), angle, distance, detectionStreak,
+                  confirmed ? "CONFIRMED ⚠️" : 
+                  (inRange ? "checking..." : "clear"));
+
+    vTaskDelay(pdMS_TO_TICKS(LOOP_PERIOD_MS));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CORE 0 TASK: Network (Telegram + MQTT keepalive)
+// ═══════════════════════════════════════════════════════════════
+void networkTask(void *parameter) {
+  Serial.println("✓ Network task on Core " + String(xPortGetCoreID()));
+
+  while (true) {
+    
+    // ── Keep WiFi alive ────────────────────────────────────
+    wifiReconnect();
+    
+    // ── Keep MQTT alive ────────────────────────────────────
+    if (!mqtt.connected()) mqttConnect();
+    mqtt.loop();
+
+    // ── Send queued Telegram alerts ────────────────────────
+    bool   needToSend = false;
+    String msgToSend  = "";
+
+    if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100))) {
+      if (alertPending) {
+        needToSend   = true;
+        msgToSend    = alertMessage;
+        alertPending = false;
+      }
+      xSemaphoreGive(dataMutex);
+    }
+
+    if (needToSend) {
+      bot.sendMessage(CHAT_ID, msgToSend, "Markdown");
+      Serial.println("→ Alert sent to Telegram");
+    }
+
+    // ── Check incoming Telegram messages ───────────────────
+    int numNew = bot.getUpdates(bot.last_message_received + 1);
+    while (numNew) {
+      handleMessages(numNew);
+      numNew = bot.getUpdates(bot.last_message_received + 1);
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  HANDLE TELEGRAM COMMANDS
+// ═══════════════════════════════════════════════════════════════
+void handleMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id  = bot.messages[i].chat_id;
+    String text     = bot.messages[i].text;
+    String fromName = bot.messages[i].from_name;
+
+    Serial.println("Message from " + fromName + ": " + text);
+
+    if (text == "/start") {
+      monitoringEnabled = true;
+      alertPending = false;
+      bot.sendMessage(chat_id,
+        "✅ *Monitoring ENABLED*\n\nYou'll receive alerts when objects are detected.",
+        "Markdown");
+    }
+
+    else if (text == "/stop") {
+      monitoringEnabled = false;
+      bot.sendMessage(chat_id,
+        "🛑 *Monitoring DISABLED*\n\nNo more alerts will be sent.",
+        "Markdown");
+    }
+
+    else if (text == "/status") {
+      int   safeAngle    = 0;
+      float safeDist     = 0;
+      bool  safeDetected = false;
+      int   safeAlerts   = 0;
+      int   safeBlocked  = 0;
+
+      if (xSemaphoreTake(dataMutex, pdMS_TO_TICKS(100))) {
+        safeAngle    = currentAngle;
+        safeDist     = currentDistance;
+        safeDetected = objectDetected;
+        safeAlerts   = totalAlerts;
+        safeBlocked  = falseAlarmsBlocked;
+        xSemaphoreGive(dataMutex);
+      }
+      
+      int totalEvents = safeAlerts + safeBlocked;
+      float accuracy = (totalEvents > 0) ? 
+                       ((float)safeBlocked / totalEvents * 100) : 0;
+
+      String msg = "📊 *System Status*\n\n";
+      msg += "📐 Angle: `"    + String(safeAngle)   + "°`\n";
+      msg += "📏 Distance: `" + String(safeDist, 1) + " cm`\n";
+      msg += "🎯 Target: "    + String(safeDetected ? "*CONFIRMED* ⚠️" : "Clear") + "\n";
+      msg += "🔔 Alerts: "    + String(monitoringEnabled ? "ON" : "OFF") + "\n\n";
+      msg += "📈 *Statistics*\n";
+      msg += "✅ Real alerts: `" + String(safeAlerts) + "`\n";
+      msg += "🛡️ Blocked: `"   + String(safeBlocked) + "` false alarms\n";
+      msg += "🎯 Filter rate: `" + String(accuracy, 1) + "%`\n\n";
+      msg += "📡 MQTT: " + String(mqtt.connected() ? "Online" : "Offline");
+
+      bot.sendMessage(chat_id, msg, "Markdown");
+    }
+
+    else if (text == "/help") {
+      String help = "📖 *Radar Bot Commands*\n\n";
+      help += "/status — Live readings & stats\n";
+      help += "/start  — Enable alert notifications\n";
+      help += "/stop   — Disable alert notifications\n";
+      help += "/help   — Show this message";
+      bot.sendMessage(chat_id, help, "Markdown");
+    }
+
+    else {
+      String help = "❓ *Unknown command*\n\nSend /help for available commands.";
+      bot.sendMessage(chat_id, help, "Markdown");
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SETUP - launches both cores
+// ═══════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n\n╔═══════════════════════════════════════╗");
+  Serial.println("║   ESP32-S3 Smart Radar System v2.0    ║");
+  Serial.println("╚═══════════════════════════════════════╝");
+
+  // Hardware
+  pinMode(TrigPin, OUTPUT);
+  pinMode(EchoPin, INPUT);
+  pinMode(LED, OUTPUT);
+  myServo.attach(ServoPin);
+  myServo.write(SWEEP_MIN_ANGLE);
+
+  // WiFi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    digitalWrite(LED, HIGH); delay(250);
+    digitalWrite(LED, LOW);  delay(250);
+    Serial.print(".");
+  }
+  Serial.println("\n✓ WiFi: " + WiFi.localIP().toString());
+
+  // Telegram setup
+  secured_client.setInsecure();
+  
+  // MQTT setup
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setBufferSize(256);
+  mqttConnect();
+
+  // Mutex
+  dataMutex = xSemaphoreCreateMutex();
+
+  // Boot notification
+  bot.sendMessage(CHAT_ID,
+    "🚀 *Radar System Online*\n\n"
+    "✅ Dual-core active\n"
+    "✅ MQTT streaming\n"
+    "✅ Smart filter ready\n\n"
+    "Send /help for commands",
+    "Markdown");
+
+  // Launch tasks
+  xTaskCreatePinnedToCore(radarTask,   "RadarTask",   4096, NULL, 2, NULL, 1);
+  xTaskCreatePinnedToCore(networkTask, "NetworkTask", 8192, NULL, 1, NULL, 0);
+
+  Serial.println("✓ Both cores launched. System ready.\n");
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  loop() unused - all work happens in tasks
+// ═══════════════════════════════════════════════════════════════
+void loop() {
+  vTaskDelete(NULL);
+}
