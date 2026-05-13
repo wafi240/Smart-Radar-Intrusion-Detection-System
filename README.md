@@ -2,7 +2,6 @@
 
 # 🛰️ ESP32 Smart Radar & Intrusion Detection System
 
-<img src="C:\Users\HP\Desktop\Photo_image\hq720.jpg" width="700" alt="ESP32 Radar Project"/>
 
 ![ESP32](https://img.shields.io/badge/ESP32-Microcontroller-red?style=for-the-badge&logo=espressif)
 ![Arduino](https://img.shields.io/badge/Arduino-IDE-blue?style=for-the-badge&logo=arduino)
